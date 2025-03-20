@@ -1,14 +1,14 @@
 #!/bin/bash
 
-MODEL=lss
+MODEL=lss_temporal # lss lss_bevformer lss_temporal
 ROBOT=marv
 DEBUG=False
 VIS=False
-BSZ=24  # 24, 24, 4
-WEIGHTS=$HOME/workspaces/traversability_ws/src/monoforce/monoforce/config/weights/${MODEL}/val.pth
+BSZ=1  # 24, 24, 4
+WEIGHTS=$HOME/THESIS/monoforce/monoforce/config/weights/lss/val.pth  # config/weights/${MODEL}/val.pth
 
-source $HOME/workspaces/traversability_ws/devel/setup.bash
-./train.py --bsz $BSZ --nepochs 1000 --lr 1e-4 \
+# source $HOME/workspaces/traversability_ws/devel/setup.bash
+./train.py --bsz $BSZ --nepochs 100 --lr 1e-4 \
            --debug $DEBUG --vis $VIS \
            --geom_weight 1.0 --terrain_weight 3.0 --phys_weight 4.0 \
            --traj_sim_time 5.0 \

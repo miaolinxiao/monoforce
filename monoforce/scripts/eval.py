@@ -13,7 +13,7 @@ from scipy.spatial.transform import Rotation
 import argparse
 from monoforce.models.traj_predictor.dphys_config import DPhysConfig
 from monoforce.models.traj_predictor.dphysics import DPhysics
-from monoforce.models.terrain_encoder.lss import LiftSplatShoot
+from monoforce.models.terrain_encoder import LiftSplatShoot, LiftSplatShoot_Transformer, LiftSplatShoot_Temporal
 from monoforce.models.terrain_encoder.utils import ego_to_cam, get_only_in_img_mask, denormalize_img
 from monoforce.utils import read_yaml, write_to_csv, append_to_csv, compile_data, str2bool
 from monoforce.losses import physics_loss, hm_loss
@@ -69,6 +69,12 @@ class Eval:
         if model == 'lss':
             terrain_encoder = LiftSplatShoot(self.lss_config['grid_conf'],
                                              self.lss_config['data_aug_conf']).from_pretrained(path)
+        elif model == 'lss_bevformer':
+            terrain_encoder = LiftSplatShoot_Transformer(self.lss_config['grid_conf'],
+                                             self.lss_config['data_aug_conf']).from_pretrained(path)
+        elif model == 'lss_temporal':
+            terrain_encoder = LiftSplatShoot_Temporal(self.lss_config['grid_conf'],
+                                             self.lss_config['data_aug_conf']).from_pretrained(path)
         else:
             raise ValueError(f'Invalid terrain encoder model: {model}. Supported: lss')
         terrain_encoder.to(self.device)
@@ -77,12 +83,12 @@ class Eval:
 
     def predict_terrain(self, batch):
         model = self.terrain_encoder.__class__.__name__
-        if model == 'LiftSplatShoot':
+        if model == 'LiftSplatShoot' or model == 'LiftSplatShoot_Transformer':
             imgs, rots, trans, intrins, post_rots, post_trans = batch[:6]
             img_inputs = (imgs, rots, trans, intrins, post_rots, post_trans)
             terrain = self.terrain_encoder(*img_inputs)
         else:
-            raise ValueError(f'Invalid terrain encoder model: {model}. Supported: LiftSplatShoot')
+            raise ValueError(f'Invalid terrain encoder model: {model}. Supported: LiftSplatShoot, LiftSplatShoot_Transformer')
         return terrain
 
     def get_traj_pred(self, model='dphysics'):
@@ -269,15 +275,245 @@ class Eval:
             plt.savefig(f'{self.output_folder}/{i:04d}.png')
         plt.close(fig)
 
+class Eval_Temporal(Eval):
+    def __init__(self,
+                 seq='val',
+                 batch_size=1,
+                 terrain_encoder='lss',
+                 terrain_encoder_path=None,
+                 traj_predictor='dphysics'):
+        super().__init__(seq, batch_size, terrain_encoder, terrain_encoder_path, traj_predictor)
+
+        self.terrain_encoder = LiftSplatShoot_Temporal(self.lss_config['grid_conf'],
+                               self.lss_config['data_aug_conf']).from_pretrained(terrain_encoder_path)
+        self.terrain_encoder.to(self.device)
+        self.terrain_encoder.eval()
+
+        self.bev_history_feats = None
+        # load data
+        self.loader = self.get_dataloader(batch_size=batch_size, seq=seq)
+
+    def _compile_temporal_data(self, val_fraction=0.1, Data=ROUGH, dphys_cfg=None, lss_cfg=None):
+        from torch.utils.data import ConcatDataset
+        from monoforce.datasets import rough_seq_paths
+
+        train_datasets = []
+        val_datasets = []
+        print('Data paths:', rough_seq_paths)
+        for path in rough_seq_paths:
+            assert os.path.exists(path)
+            train_ds = Data(path, is_train=True, dphys_cfg=dphys_cfg, lss_cfg=lss_cfg)
+            val_ds = Data(path, is_train=False, dphys_cfg=dphys_cfg, lss_cfg=lss_cfg)
+
+            # 顺序分割数据集：前 val_ds_size 条作为验证集，剩余作为训练集
+            val_ds_size = int(val_fraction * len(train_ds))
+            val_ids = np.arange(val_ds_size)
+            train_ids = np.arange(val_ds_size, len(train_ds))
+
+            train_ds = train_ds[train_ids]
+            val_ds = val_ds[val_ids]
+            print(f'Train dataset from path {path} size is {len(train_ds)}')
+            print(f'Validation dataset from path {path} size is {len(val_ds)}')
+
+            train_datasets.append(train_ds)
+            val_datasets.append(val_ds)
+
+        # concatenate datasets
+        train_ds = ConcatDataset(train_datasets)
+        val_ds = ConcatDataset(val_datasets)
+
+        print('Concatenated datasets length: train %i, valid: %i' % (len(train_ds), len(val_ds)))
+
+        return train_ds, val_ds
+    
+    def predict_terrain(self, batch):
+        imgs, rots, trans, intrins, post_rots, post_trans = batch[:6]
+        img_inputs = (imgs, rots, trans, intrins, post_rots, post_trans)
+        terrain, self.bev_history_feats = self.terrain_encoder(*img_inputs, self.bev_history_feats)
+        return terrain
+
+    def get_dataloader(self, batch_size=1, seq='val'):
+        if seq != 'val':
+            print('Loading dataset from:', seq)
+            val_ds = ROUGH(path=seq, lss_cfg=self.lss_config, dphys_cfg=self.dphys_cfg)
+        else:
+            _, val_ds = self._compile_temporal_data(lss_cfg=self.lss_config, dphys_cfg=self.dphys_cfg)
+        loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+        return loader
+
+    @torch.inference_mode()
+    def run(self, vis=False):
+        # create output folder
+        os.makedirs(self.output_folder, exist_ok=True)
+        # write losses to output csv
+        write_to_csv(f'{self.output_folder}/losses.csv', 'Batch i,H_g loss,H_t loss,XYZ loss,Rot loss\n')
+
+        H, W = self.lss_config['data_aug_conf']['H'], self.lss_config['data_aug_conf']['W']
+        cams = ['cam_left', 'cam_front', 'cam_right', 'cam_rear']
+
+        x_grid = torch.arange(-self.dphys_cfg.d_max, self.dphys_cfg.d_max, self.dphys_cfg.grid_res)
+        y_grid = torch.arange(-self.dphys_cfg.d_max, self.dphys_cfg.d_max, self.dphys_cfg.grid_res)
+        x_grid, y_grid = torch.meshgrid(x_grid, y_grid)
+
+        self.bev_history_feats = None
+
+        fig, axes = plt.subplots(3, 4, figsize=(20, 16))
+        for i, batch in enumerate(tqdm(self.loader)):
+            batch = [t.to(self.device) for t in batch]
+            # get a sample from the dataset
+            (imgs, rots, trans, intrins, post_rots, post_trans,
+             hm_geom, hm_terrain,
+             control_ts, controls,
+             pose0,
+             traj_ts, Xs, Xds, Rs, Omegas) = batch
+            states_gt = [Xs, Xds, Rs, Omegas]
+
+            # terrain prediction
+            terrain = self.predict_terrain(batch)
+            H_t_pred, H_g_pred, H_diff_pred, Friction_pred = terrain['terrain'], terrain['geom'], terrain['diff'], \
+            terrain['friction']
+
+            # terrain and geom heightmap losses
+            loss_geom = hm_loss(height_pred=H_g_pred[:, 0], height_gt=hm_geom[:, 0], weights=hm_geom[:, 1])
+            loss_terrain = hm_loss(height_pred=H_t_pred[:, 0], height_gt=hm_terrain[:, 0], weights=hm_terrain[:, 1])
+
+            # trajectory prediction loss: xyz and rotation
+            states_pred = self.predict_states(terrain, batch)
+            loss_xyz, loss_rot = physics_loss(states_pred=states_pred, states_gt=states_gt,
+                                              pred_ts=control_ts, gt_ts=traj_ts,
+                                              gamma=1.0, rotation_loss=True)
+
+            # write losses to csv
+            append_to_csv(f'{self.output_folder}/losses.csv',
+                          f'{i:04d}, {loss_geom.item()},{loss_terrain.item()},{loss_xyz.item()},{loss_rot.item()}\n')
+
+            # visualizations
+            H_g_pred = H_g_pred[0, 0].cpu()
+            H_diff_pred = H_diff_pred[0, 0].cpu()
+            H_t_pred = H_t_pred[0, 0].cpu()
+            Friction_pred = Friction_pred[0, 0].cpu()
+            # get height map points
+            hm_points = torch.stack([x_grid, y_grid, H_t_pred], dim=-1)
+            hm_points = hm_points.view(-1, 3).T
+
+            batch = [t.to('cpu') for t in batch]
+            # get a sample from the dataset
+            (imgs, rots, trans, intrins, post_rots, post_trans,
+             hm_geom, hm_terrain,
+             control_ts, controls,
+             pose0,
+             traj_ts, Xs, Xds, Rs, Omegas) = batch
+            states_gt = [Xs, Xds, Rs, Omegas]
+
+            # clear axis
+            for ax in axes.flatten():
+                ax.clear()
+            plt.suptitle(f'Terrain Loss: {loss_terrain.item():.3f}, Traj Loss: {loss_xyz.item() + loss_rot.item():.3f}')
+            for imgi, img in enumerate(imgs[0]):
+                ax = axes[0, imgi]
+
+                cam_pts = ego_to_cam(hm_points, rots[0, imgi], trans[0, imgi], intrins[0, imgi])
+                mask = get_only_in_img_mask(cam_pts, H, W)
+                plot_pts = post_rots[0, imgi].matmul(cam_pts) + post_trans[0, imgi].unsqueeze(1)
+                showimg = denormalize_img(img)
+
+                ax.imshow(showimg)
+                ax.scatter(plot_pts[0, mask], plot_pts[1, mask],
+                           # c=Friction_pred.view(-1)[terrain_mask][mask],
+                           c=hm_points[2, mask],
+                           s=2, alpha=0.8, cmap='jet', vmin=-1, vmax=1.)
+                ax.axis('off')
+                # camera name as text on image
+                ax.text(0.5, 0.9, cams[imgi].replace('_', ' '),
+                        horizontalalignment='center', verticalalignment='top',
+                        transform=ax.transAxes, fontsize=10)
+
+            # plot geom heightmap
+            axes[1, 0].set_title('Geom Height')
+            axes[1, 0].imshow(H_g_pred.T, origin='lower', cmap='jet', vmin=-1., vmax=1.)
+            axes[1, 0].axis('off')
+
+            # plot height diff heightmap
+            axes[1, 1].set_title('Height Difference')
+            axes[1, 1].imshow(H_diff_pred.T, origin='lower', cmap='jet', vmin=-1., vmax=1.)
+            axes[1, 1].axis('off')
+
+            # plot terrain heightmap
+            axes[1, 2].set_title('Terrain Height')
+            axes[1, 2].imshow(H_t_pred.T, origin='lower', cmap='jet', vmin=-1., vmax=1.)
+            axes[1, 2].axis('off')
+
+            # plot friction map
+            axes[1, 3].set_title('Friction')
+            axes[1, 3].imshow(Friction_pred.T, origin='lower', cmap='jet', vmin=0., vmax=1.)
+            axes[1, 3].axis('off')
+
+            # plot control inputs
+            axes[2, 0].plot(control_ts[0], controls[0, :, 0], c='g', label='v(t)')
+            axes[2, 0].plot(control_ts[0], controls[0, :, 1], c='b', label='w(t)')
+            axes[2, 0].grid()
+            axes[2, 0].set_xlabel('Time [s]')
+            axes[2, 0].set_ylabel('Control [m/s]')
+            axes[2, 0].legend()
+
+            # plot trajectories: Roll, Pitch, Yaw
+            rpy = Rotation.from_matrix(states_pred[2][0].cpu()).as_euler('xyz')
+            rpy_gt = Rotation.from_matrix(states_gt[2][0].cpu()).as_euler('xyz')
+            axes[2, 1].plot(control_ts[0], rpy[:, 0], 'r', label='Pred Roll')
+            axes[2, 1].plot(control_ts[0], rpy[:, 1], 'g', label='Pred Pitch')
+            axes[2, 1].plot(control_ts[0], rpy[:, 2], 'b', label='Pred Yaw')
+            axes[2, 1].plot(traj_ts[0], rpy_gt[:, 0], 'r--', label='Roll')
+            axes[2, 1].plot(traj_ts[0], rpy_gt[:, 1], 'g--', label='Pitch')
+            axes[2, 1].plot(traj_ts[0], rpy_gt[:, 2], 'b--', label='Yaw')
+            axes[2, 1].grid()
+            axes[2, 1].set_xlabel('Time [s]')
+            axes[2, 1].set_ylabel('Angle [rad]')
+            axes[2, 1].set_ylim(-np.pi / 2., np.pi / 2.)
+            # axes[2, 1].legend()
+
+            # plot trajectories: XY
+            axes[2, 2].plot(states_pred[0][0, :, 0].cpu(), states_pred[0][0, :, 1].cpu(), 'r', label='Pred Traj')
+            axes[2, 2].plot(states_gt[0][0, :, 0], states_gt[0][0, :, 1], 'k', label='GT Traj')
+            axes[2, 2].set_xlim(-self.dphys_cfg.d_max, self.dphys_cfg.d_max)
+            axes[2, 2].set_ylim(-self.dphys_cfg.d_max, self.dphys_cfg.d_max)
+            axes[2, 2].grid()
+            axes[2, 2].set_xlabel('x [m]')
+            axes[2, 2].set_ylabel('y [m]')
+            axes[2, 2].legend()
+
+            # plot trajectories: Z
+            axes[2, 3].plot(control_ts[0], states_pred[0][0, :, 2].cpu(), 'r', label='Pred Traj')
+            axes[2, 3].plot(traj_ts[0], states_gt[0][0, :, 2], 'k', label='GT Traj')
+            axes[2, 3].grid()
+            axes[2, 3].set_xlabel('Time [s]')
+            axes[2, 3].set_ylabel('z [m]')
+            axes[2, 3].set_ylim(-self.dphys_cfg.h_max, self.dphys_cfg.h_max)
+            axes[2, 3].legend()
+
+            if vis:
+                plt.pause(0.01)
+                plt.draw()
+            plt.savefig(f'{self.output_folder}/{i:04d}.png')
+        plt.close(fig)
+        self.bev_history_feats = None
+
+def choose_evaluator(model):
+    if model == 'lss' or model == 'lss_bevformer':
+        return Eval
+    elif model == 'lss_temporal':
+        return Eval_Temporal
+    else:
+        raise ValueError(f'Invalid model: {model}. Supported models: lss, lss_bevformer, lss_temporal')
 
 def main():
     args = arg_parser()
     print(args)
-    monoforce = Eval(seq=args.seq,
-                     batch_size=args.batch_size,
-                     terrain_encoder=args.terrain_encoder,
-                     terrain_encoder_path=args.terrain_encoder_path,
-                     traj_predictor=args.traj_predictor)
+    Evaluator = choose_evaluator(args.terrain_encoder)
+    monoforce = Evaluator(seq=args.seq,
+                          batch_size=args.batch_size,
+                          terrain_encoder=args.terrain_encoder,
+                          terrain_encoder_path=args.terrain_encoder_path,
+                          traj_predictor=args.traj_predictor)
     monoforce.run(vis=args.vis)
 
 

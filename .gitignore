@@ -165,3 +165,10 @@ gen*/
 *.pth
 *.pt
 *.bak
+monoforce/train.err
+monoforce/train.out
+monoforce/trainv2100.err
+monoforce/trainv2100.out
+monoforce/examples/losses.csv
+*.zip
+monoforce/run_train.sh

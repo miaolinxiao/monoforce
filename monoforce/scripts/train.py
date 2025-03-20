@@ -7,7 +7,7 @@ import torch
 import numpy as np
 from torch.utils.data import DataLoader
 from monoforce.models.terrain_encoder.utils import denormalize_img, ego_to_cam, get_only_in_img_mask
-from monoforce.models.terrain_encoder.lss import LiftSplatShoot
+from monoforce.models.terrain_encoder import LiftSplatShoot, LiftSplatShoot_Transformer, LiftSplatShoot_Temporal
 from monoforce.models.traj_predictor.dphysics import DPhysics
 from monoforce.models.traj_predictor.dphys_config import DPhysConfig
 from monoforce.datasets.rough import ROUGH
@@ -362,16 +362,32 @@ class TrainerCore:
 
 
 class TrainerLSS(TrainerCore):
-    def __init__(self, dphys_cfg, lss_cfg, model='lss', bsz=1, lr=1e-3, nepochs=1000,
-                 pretrained_model_path=None, debug=False, vis=False, geom_weight=1.0, terrain_weight=1.0, phys_weight=1.0):
+    def __init__(self, 
+                 dphys_cfg, 
+                 lss_cfg, 
+                 model='lss', 
+                 bsz=1, 
+                 lr=1e-3, 
+                 nepochs=1000,
+                 pretrained_model_path=None, 
+                 debug=False, 
+                 vis=False, 
+                 geom_weight=1.0, 
+                 terrain_weight=1.0, 
+                 phys_weight=1.0):
         super().__init__(dphys_cfg, lss_cfg, model, bsz, lr, nepochs, pretrained_model_path, debug, vis,
                          geom_weight, terrain_weight, phys_weight)
         # create dataloaders
         self.train_loader, self.val_loader = self.create_dataloaders(bsz=bsz, debug=debug, vis=vis, Data=ROUGH)
 
         # load models: terrain encoder
-        self.terrain_encoder = LiftSplatShoot(self.lss_cfg['grid_conf'],
-                                              self.lss_cfg['data_aug_conf']).from_pretrained(pretrained_model_path)
+        if model == 'lss':
+            self.terrain_encoder = LiftSplatShoot(self.lss_cfg['grid_conf'],
+                                                  self.lss_cfg['data_aug_conf']).from_pretrained(pretrained_model_path)
+        elif model == 'lss_bevformer':
+            self.terrain_encoder = LiftSplatShoot_Transformer(self.lss_cfg['grid_conf'],
+                                                  self.lss_cfg['data_aug_conf']).from_pretrained(pretrained_model_path)
+
         self.terrain_encoder.to(self.device)
 
         # define optimizer
@@ -428,11 +444,200 @@ class TrainerLSS(TrainerCore):
 
         return terrain, states_pred
 
+class TrainerLSS_temporal(TrainerCore):
+    def __init__(self, 
+                 dphys_cfg, 
+                 lss_cfg, 
+                 model='lss', 
+                 bsz=1, 
+                 lr=1e-4, 
+                 nepochs=1000,
+                 pretrained_model_path=None, 
+                 debug=False, 
+                 vis=False, 
+                 geom_weight=1.0, 
+                 terrain_weight=1.0, 
+                 phys_weight=1.0):
+        super().__init__(dphys_cfg, lss_cfg, model, bsz, lr, nepochs, pretrained_model_path, debug, vis,
+                         geom_weight, terrain_weight, phys_weight)
+        
+        assert bsz == 1 , "bsz must be 1 for temporal model"
+        # create dataloaders
+        self.train_loader, self.val_loader = self.create_dataloaders(bsz=bsz)
+
+        # load models: terrain encoder
+        self.terrain_encoder = LiftSplatShoot_Temporal(self.lss_cfg['grid_conf'],
+                                                self.lss_cfg['data_aug_conf']).from_pretrained(pretrained_model_path)
+        self.terrain_encoder.to(self.device)
+
+        # define optimizer
+        self.optimizer = torch.optim.Adam(self.terrain_encoder.parameters(),
+                                          lr=lr, betas=(0.8, 0.999), weight_decay=1e-7)
+        
+        # temporal hidden feature
+        self.bev_hidden_feats = None
+
+    def _compile_temporal_data(self, val_fraction=0.1, Data=ROUGH, dphys_cfg=None, lss_cfg=None):
+        from torch.utils.data import ConcatDataset
+        from monoforce.datasets import rough_seq_paths
+
+        train_datasets = []
+        val_datasets = []
+        print('Data paths:', rough_seq_paths)
+        for path in rough_seq_paths:
+            assert os.path.exists(path)
+            train_ds = Data(path, is_train=True, dphys_cfg=dphys_cfg, lss_cfg=lss_cfg)
+            val_ds = Data(path, is_train=False, dphys_cfg=dphys_cfg, lss_cfg=lss_cfg)
+
+            # 顺序分割数据集：前 val_ds_size 条作为验证集，剩余作为训练集
+            val_ds_size = int(val_fraction * len(train_ds))
+            val_ids = np.arange(val_ds_size)
+            train_ids = np.arange(val_ds_size, len(train_ds))
+
+            train_ds = train_ds[train_ids]
+            val_ds = val_ds[val_ids]
+            print(f'Train dataset from path {path} size is {len(train_ds)}')
+            print(f'Validation dataset from path {path} size is {len(val_ds)}')
+
+            train_datasets.append(train_ds)
+            val_datasets.append(val_ds)
+
+        # concatenate datasets
+        train_ds = ConcatDataset(train_datasets)
+        val_ds = ConcatDataset(val_datasets)
+
+        print('Concatenated datasets length: train %i, valid: %i' % (len(train_ds), len(val_ds)))
+
+        return train_ds, val_ds
+    
+    def create_dataloaders(self, bsz=1):
+        # create dataset for LSS model training
+        train_ds, val_ds = self._compile_temporal_data(Data=ROUGH, dphys_cfg=self.dphys_cfg, lss_cfg=self.lss_cfg)
+
+        # create dataloaders: making sure all elemts in a batch are tensors
+        def collate_fn(batch):
+            def to_tensor(item):
+                if isinstance(item, np.ndarray):
+                    return torch.tensor(item)
+                elif isinstance(item, (list, tuple)):
+                    return [to_tensor(i) for i in item]
+                elif isinstance(item, dict):
+                    return {k: to_tensor(v) for k, v in item.items()}
+                return item  # Return as is if it's already a tensor or unsupported type
+
+            batch = [to_tensor(item) for item in batch]
+            return torch.utils.data.default_collate(batch)
+
+        train_loader = DataLoader(train_ds, batch_size=bsz, shuffle=False, collate_fn=collate_fn)
+        val_loader = DataLoader(val_ds, batch_size=bsz, shuffle=False, collate_fn=collate_fn)
+
+        return train_loader, val_loader
+
+    def epoch(self, train=True):
+
+        self.bev_hidden_feats = None
+
+        loader = self.train_loader if train else self.val_loader
+        counter = self.train_counter if train else self.val_counter
+
+        if train:
+            self.terrain_encoder.train()
+        else:
+            self.terrain_encoder.eval()
+
+        max_grad_norm = 1.0
+        epoch_losses = {'geom': 0.0, 'terrain': 0.0, 'phys': 0.0, 'total': 0.0}
+        for batch in tqdm(loader, total=len(loader)):
+            if train:
+                self.optimizer.zero_grad()
+
+            batch = [torch.as_tensor(b, dtype=torch.float32, device=self.device) for b in batch]
+            loss_geom, loss_terrain, loss_phys = self.compute_losses(batch)
+            loss = self.geom_weight * loss_geom + self.terrain_weight * loss_terrain + self.phys_weight * loss_phys
+
+            if torch.isnan(loss).item():
+                torch.save(self.terrain_encoder.state_dict(), os.path.join(self.log_dir, 'train.pth'))
+                raise ValueError('Loss is NaN')
+
+            if train:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.terrain_encoder.parameters(), max_norm=max_grad_norm)
+                self.optimizer.step()
+
+            epoch_losses['geom'] += loss_geom.item()
+            epoch_losses['terrain'] += loss_terrain.item()
+            epoch_losses['phys'] += loss_phys.item()
+            epoch_losses['total'] += (loss_geom + loss_terrain + loss_phys).item()
+
+            counter += 1
+            self.writer.add_scalar(f"{'train' if train else 'val'}/iter_loss_geom", loss_geom.item(), counter)
+            self.writer.add_scalar(f"{'train' if train else 'val'}/iter_loss_terrain", loss_terrain.item(), counter)
+            self.writer.add_scalar(f"{'train' if train else 'val'}/iter_loss_phys", loss_phys.item(), counter)
+            self.writer.add_scalar(f"{'train' if train else 'val'}/iter_loss_total", loss.item(), counter)
+        
+        self.bev_hidden_feats = None
+
+        if len(loader) > 0:
+            for k, v in epoch_losses.items():
+                epoch_losses[k] /= len(loader)
+
+        return epoch_losses, counter
+
+    def compute_losses(self, batch):
+        (imgs, rots, trans, intrins, post_rots, post_trans,
+         hm_geom, hm_terrain,
+         control_ts, controls,
+         pose0,
+         traj_ts, Xs, Xds, Rs, Omegas) = batch
+        # terrain encoder forward pass
+        inputs = [imgs, rots, trans, intrins, post_rots, post_trans]
+        terrain, self.bev_hidden_feats = self.terrain_encoder(*inputs, self.bev_hidden_feats)
+
+        # geometry loss: difference between predicted and ground truth height maps
+        if self.geom_weight > 0:
+            loss_geom = hm_loss(terrain['geom'], hm_geom[:, 0:1], hm_geom[:, 1:2])
+        else:
+            loss_geom = torch.tensor(0.0, device=self.device)
+
+        # rigid / terrain height map loss
+        if self.terrain_weight > 0:
+            loss_terrain = hm_loss(terrain['terrain'], hm_terrain[:, 0:1], hm_terrain[:, 1:2])
+        else:
+            loss_terrain = torch.tensor(0.0, device=self.device)
+
+        # physics loss: difference between predicted and ground truth states
+        if self.phys_weight > 0:
+            # predict trajectory
+            states_gt = [Xs, Xds, Rs, Omegas]
+            states_pred = self.predicts_states(terrain, pose0, controls)
+            # compute physics loss
+            loss_phys = physics_loss(states_pred=states_pred, states_gt=states_gt,
+                                     pred_ts=control_ts, gt_ts=traj_ts)
+        else:
+            loss_phys = torch.tensor(0.0, device=self.device)
+
+        return loss_geom, loss_terrain, loss_phys
+
+    def pred(self, batch):
+        (imgs, rots, trans, intrins, post_rots, post_trans,
+         _, _, _, controls, pose0, _, _, _, _, _) = batch
+        # predict height maps
+        img_inputs = [imgs, rots, trans, intrins, post_rots, post_trans]
+        terrain, self.bev_hidden_feats = self.terrain_encoder(*img_inputs, self.bev_hidden_feats)
+
+        # predict states
+        states_pred = self.predicts_states(terrain, pose0, controls)
+
+        return terrain, states_pred
+
+
 def choose_trainer(model):
-    if model == 'lss':
+    if model == 'lss' or model == 'lss_bevformer':
         return TrainerLSS
+    elif model == 'lss_temporal':
+        return TrainerLSS_temporal
     else:
-        raise ValueError(f'Invalid model: {model}. Supported models: lss')
+        raise ValueError(f'Invalid model: {model}. Supported models: lss, lss_bevformer, lss_temporal')
 
 
 def main():
